@@ -11,7 +11,10 @@ from mup.coord_check import get_coord_data, plot_coord_data
 from mup import set_base_shapes, make_base_shapes
 from transformers import BertTokenizer, GPT2Tokenizer
 
-from mutransformers import BertConfig, BertForMaskedLM, RobertaConfig, RobertaForMaskedLM, GPT2Config, GPT2LMHeadModel
+from mutransformers import (
+  BertConfig, BertForMaskedLM, RobertaConfig, RobertaForMaskedLM, GPT2Config, GPT2LMHeadModel,
+  HFHolo, HFHoloConfig,
+)
 
 sns.set()
 
@@ -21,7 +24,7 @@ def get_dataloader(arch):
     input_ids = tokenizer("The capital of France is [MASK].", return_tensors="pt")['input_ids']
     labels = tokenizer("The capital of France is Paris.", return_tensors="pt")["input_ids"]
     dataloader = cycle([dict(input_ids=input_ids, labels=labels)])
-  elif arch == 'gpt2':
+  elif arch in ('gpt2', 'holo'):
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     text = "The capital of France is Paris."
     encoded_input = tokenizer(text, return_tensors='pt')
@@ -89,12 +92,23 @@ def make_bsh(arch, filename=None):
     )
     base_model = GPT2LMHeadModel(config=base_config)
     delta_model = GPT2LMHeadModel(config=delta_config)
+  elif arch == 'holo':
+    base_config = HFHoloConfig(
+      model_dims=256,
+      num_hidden_layers=2,
+    )
+    delta_config = HFHoloConfig(
+      model_dims=200,
+      num_hidden_layers=2,
+    )
+    base_model = HFHolo(config=base_config)
+    delta_model = HFHolo(config=delta_config)
   else:
     raise NotImplementedError()
   base_shapes = make_base_shapes(base_model, delta_model, savefile=filename)
   return base_shapes
 
-def get_lazy_model(arch, width, base_shape=None, mup=True, readout_zero_init=True, query_zero_init=True, vary_nhead=False):
+def get_lazy_model(arch, width, base_shape=None, mup=True, readout_zero_init=False, query_zero_init=False, vary_nhead=False):
   width = int(width)
   nhead = 4
   if vary_nhead:
@@ -139,6 +153,12 @@ def get_lazy_model(arch, width, base_shape=None, mup=True, readout_zero_init=Tru
         # attn_pdrop=0,
       )
       model = GPT2LMHeadModel(config=config)
+    elif arch == 'holo':
+      config = HFHoloConfig(
+        model_dims=width,
+        num_hidden_layers=2,
+      )
+      model = HFHolo(config=config)
     if mup:
       set_base_shapes(model, base_shape)
     else:
@@ -154,9 +174,10 @@ def get_lazy_model(arch, width, base_shape=None, mup=True, readout_zero_init=Tru
 
 def plot_coord_check(arch, mup=True, vary_nhead=False, y='l1', widths=None, optimizer='adam',
                     nseeds=1, nsteps=4, loglog=False, logbase=2, legend=None,
+                    name_contains=None, name_not_contains=None,
                     **get_coord_data_kw):
   if widths is None:
-    widths = 2**np.arange(6, 11)
+    widths = 2**np.arange(6, 12)
   base_shape = make_bsh(arch)
   models = {width: get_lazy_model(arch, width, base_shape=base_shape, mup=mup, vary_nhead=vary_nhead) for width in widths}
   dataloader = get_dataloader(arch)
@@ -168,4 +189,6 @@ def plot_coord_check(arch, mup=True, vary_nhead=False, y='l1', widths=None, opti
   width = 'nhead' if vary_nhead else 'dhead'
   return plot_coord_data(df, legend=legend, loglog=loglog, logbase=logbase, y=y,
         save_to=f'{arch}_{prm}_{width}_coord_check.png',  suptitle=f'{prm} {arch} {width}',
-        face_color='xkcd:light grey' if not mup else None)
+        face_color='xkcd:light grey' if not mup else None,
+        name_contains=name_contains,
+        name_not_contains=name_not_contains)
