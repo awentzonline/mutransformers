@@ -71,3 +71,30 @@ def key_value_query(
     qv = torch.real(ifft(r * inv_q))
     return qv
 
+
+def perm_key_value_query(
+    k: torch.Tensor, v: torch.Tensor, q: torch.Tensor, perms: torch.Tensor,
+    causal: bool = True,
+):
+    """
+    Create a key-value vector and then retrieve queried values using HRR.
+
+    This function is meant to reduce the number of fft/ifft calls compared to naively
+    binding k/v, summing over the sequence, and then unbinding q.
+    """
+    # NOTE: perhaps we can avoid explicitly inverting and assume inv_q is learned by the model?
+    # k, v, inv_q = fft(k), fft(v), inverse(fft(q))
+    k, v, inv_q = fft(k), fft(v), fft(q)
+    inv_q = inv_q[..., perms].permute(2, 0, 1, 3)
+    k = k[..., perms].permute(2, 0, 1, 3)
+    v = v[None, ...]
+    kv = k * v
+    if causal:
+        r = kv.cumsum(dim=-2) #* kv.shape[-1] / kv.shape[-2]
+    else:
+        r = kv.sum(dim=-2, keepdim=True)
+    # unbind values for each query/permutation and take the mean
+    qv = (r * inv_q).mean(0)
+    qv = torch.real(ifft(qv))
+    return qv
+

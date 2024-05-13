@@ -26,19 +26,79 @@ class HRRSelfAttention(nn.Module):
         k = self.keys(x)
         v = self.values(x)
         values_hat = hrr.key_value_query(k, v, q, causal=causal)
-        # values_hat = self.post_kvq(values_hat)
         values_hat = self.output(values_hat)
         return values_hat
 
 
+class RedundantHRRSelfAttention(nn.Module):
+    """
+    Use the mean of mutiple permuted copies of the data to reduce noise in the representation.
+    Associative Long Short-Term Memory: https://arxiv.org/pdf/1602.03032v2
+    """
+    def __init__(self, model_dims, num_copies=10, perm_freq=True):
+        super().__init__()
+        self.model_dims = model_dims
+        self.queries = nn.Linear(model_dims, model_dims, bias=False)
+        self.keys = nn.Linear(model_dims, model_dims, bias=False)
+        self.values = nn.Linear(model_dims, model_dims, bias=False)
+        self.output = nn.Linear(model_dims, model_dims, bias=False)
+        self.num_copies = num_copies
+        self.perm_freq = perm_freq
+        num_perms = model_dims // 2 + 1 if perm_freq else model_dims
+        self.register_buffer('permutations', torch.randn(num_copies, num_perms).argsort(-1))
+        self.post_vals = nn.Identity()
+
+    def forward(self, x, causal=True, mask=None):
+        q = self.queries(x)
+        k = self.keys(x)
+        v = self.values(x)
+        if self.perm_freq:
+            values_hat = hrr.perm_key_value_query(k, v, q, self.permutations, causal=causal)
+        else:
+            q = q[..., self.permutations].permute(2, 0, 1, 3)
+            k = k[..., self.permutations].permute(2, 0, 1, 3)
+            v = v[None, ...]
+            values_hat = hrr.key_value_query(k, v, q, causal=causal)
+            values_hat = values_hat.mean(0)
+        values_hat = self.post_vals(values_hat)
+        values_hat = self.output(values_hat)
+        return values_hat
+
+
+class MLP(nn.Module):
+    def __init__(self, model_dims, ff_dims=None):
+        super().__init__()
+        ff_dims = ff_dims or model_dims * 4
+        self.net = nn.Sequential(
+            nn.Linear(model_dims, ff_dims),
+            nn.GELU(),
+            nn.Linear(ff_dims, model_dims),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class HoloLayer(nn.Module):
-    def __init__(self, model_dims, gain_init=1., attention_class=HRRSelfAttention):
+    def __init__(self, model_dims, rezero=False, attention_class=HRRSelfAttention):
         super().__init__()
         self.self_attention = attention_class(model_dims)
+        self.mlp = MLP(model_dims)
+
+        if rezero:
+            self.norm_attn = nn.Identity()
+            self.norm_mlp = nn.Identity()
+            self.gain = nn.Parameter(torch.zeros(1))
+        else:
+            self.norm_attn = nn.LayerNorm(model_dims)
+            self.norm_mlp = nn.LayerNorm(model_dims)
+            self.gain = 1.
 
     def forward(self, x, mask=None, labels=None):
-        values_hat = self.self_attention(x, causal=True)
-        x = x + values_hat
+        values_attn = self.self_attention(self.norm_attn(x), causal=True)
+        x = x + self.gain * values_attn
+        values_mlp = self.mlp(self.norm_mlp(x))
+        x = x + self.gain * values_mlp
         return x
 
 
@@ -50,10 +110,14 @@ class HoloDecoder(PreTrainedModel):
         layer_class = HoloLayer
         attention_class = dict(
             hrr=HRRSelfAttention,
+            rhrr=RedundantHRRSelfAttention,
         )[config.attention_class]
 
         self.layers = nn.ModuleList([
-            layer_class(config.model_dims, attention_class=attention_class)
+            layer_class(
+                config.model_dims, attention_class=attention_class,
+                rezero=config.rezero,
+            )
             for _ in range(config.num_hidden_layers)
         ])
 
@@ -72,6 +136,10 @@ class HFHolo(PreTrainedModel):
         self.position_embedding = nn.Embedding(config.max_seq_len, config.model_dims)
         self.input_embedding = nn.Embedding(config.vocab_size, config.model_dims)
         self.predict_token = mup.MuReadout(config.model_dims, config.vocab_size, bias=False)
+        if config.rezero:
+            self.norm = nn.Identity()
+        else:
+            self.norm = nn.LayerNorm(config.model_dims)
 
         freeze_list = []
         if not config.learn_input_embs:
@@ -141,12 +209,13 @@ class HFHolo(PreTrainedModel):
         position_ids = position_ids[None, :].repeat(tokens.shape[0], 1)
         positions = self.position_embedding(position_ids)
 
-        if self.config.attention_class == 'hrr':
+        if self.config.attention_class in ('hrr', 'rhrr',):
             inputs = hrr.bind(tokens, positions)
         else:
             inputs = tokens + positions
 
         feats = self.decoder(inputs)
+        feats = self.norm(feats)
         logits = self.predict_token(feats)
 
         loss = 0.
